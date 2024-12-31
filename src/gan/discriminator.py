@@ -1,23 +1,14 @@
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, Dense, LeakyReLU, Dropout
+from tensorflow.keras.layers import Dense, LeakyReLU, Dropout
 
-def build_discriminator(data_dim):
-    print("Building discriminator...")
-    model = Sequential([
-        Input(shape=(data_dim,)),
-        Dense(256),
-        LeakyReLU(negative_slope=0.2),
-        Dropout(0.3),
-        Dense(128),
-        LeakyReLU(negative_slope=0.2),
-        Dropout(0.3),
-        Dense(1, activation='sigmoid')
-    ])
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0002, beta_1=0.5),
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
-    print("Discriminator built and compiled successfully.")
-    return model
+def build_discriminator(data_dim, num_classes):
+    data_input = tf.keras.Input(shape=(data_dim,))
+    label_input = tf.keras.Input(shape=(1,))
+    label_embedding = tf.keras.layers.Embedding(num_classes, data_dim)(label_input)
+    label_flat = tf.keras.layers.Flatten()(label_embedding)
+
+    merged_input = tf.keras.layers.Concatenate()([data_input, label_flat])
+    x = tf.keras.layers.Dense(128, activation="relu")(merged_input)
+    x = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+    return tf.keras.Model([data_input, label_input], x)

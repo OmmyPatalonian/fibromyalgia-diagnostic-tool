@@ -1,3 +1,4 @@
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
 
 def build_gan(generator, discriminator):
