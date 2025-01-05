@@ -32,6 +32,10 @@ import cProfile
 import pstats
 from utils.data_preprocessing import preprocess_data, load_scaler
 from torch.utils.data import Dataset, DataLoader
+import random
+import time
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def create_graph_edges(features):
     num_nodes = features.size(0)
@@ -86,156 +90,177 @@ def main():
     scaler = MinMaxScaler()
     data[['HRV', 'GSR', 'EMG']] = scaler.fit_transform(data[['HRV', 'GSR', 'EMG']])
 
-    # Split data
-    train_data = data.sample(frac=0.8, random_state=42)
-    test_data = data.drop(train_data.index)
-
     # Step 3: Balance training data
-    majority_class = train_data[train_data['Condition'] == 1]
-    minority_class = train_data[train_data['Condition'] == 0]
+    majority_class = data[data['Condition'] == 1]
+    minority_class = data[data['Condition'] == 0]
     if minority_class.empty:
         print("[ERROR] Minority class is empty. Check preprocessing.")
         return
     minority_class_upsampled = resample(minority_class, replace=True, n_samples=len(majority_class), random_state=42)
-    balanced_train_data = pd.concat([majority_class, minority_class_upsampled])
+    balanced_data = pd.concat([majority_class, minority_class_upsampled])
 
-    print("[DEBUG] Balanced train class distribution:", balanced_train_data['Condition'].value_counts())
+    print("[DEBUG] Balanced class distribution:", balanced_data['Condition'].value_counts())
 
-    # Step 4: GAN Training
-    latent_dim = 100
-    generator = build_generator(latent_dim, 3)
-    discriminator = build_discriminator(3)
-    train_gan(generator, discriminator, balanced_train_data.drop(columns=['Condition']).values, epochs=100, batch_size=64, latent_dim=latent_dim)
+    # Step 4: K-Fold Cross-Validation
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    fold_metrics = []
 
-    # Generate synthetic data
-    noise = torch.randn((len(balanced_train_data), latent_dim))
-    synthetic_data = generator(noise).detach().numpy()
-    synthetic_data_df = pd.DataFrame(synthetic_data, columns=balanced_train_data.columns.drop('Condition'))
-    synthetic_data_df['Condition'] = 1  # Label synthetic data as class 1
+    for fold, (train_index, test_index) in enumerate(kf.split(balanced_data)):
+        print(f"Fold {fold + 1}")
+        train_data = balanced_data.iloc[train_index]
+        test_data = balanced_data.iloc[test_index]
 
-    # Combine real and synthetic data
-    combined_data = pd.concat([balanced_train_data, synthetic_data_df])
+        # Step 5: GAN Training
+        latent_dim = 100
+        generator = build_generator(latent_dim, 3).to(device)
+        discriminator = build_discriminator(3).to(device)
+        train_gan(generator, discriminator, train_data.drop(columns=['Condition']).values, epochs=20, batch_size=64, latent_dim=latent_dim)
 
-    # Step 5: Train GNN
-    gnn_model = GNN(model_type='GCN', input_dim=3, hidden_dim=16, output_dim=64, pooling=True)
-    optimizer = torch.optim.Adam(gnn_model.parameters(), lr=0.001)
-    criterion = torch.nn.BCEWithLogitsLoss()
+        # Generate synthetic data
+        noise = torch.randn((len(train_data), latent_dim), device=device)
+        synthetic_data = generator(noise).detach().cpu().numpy()
+        synthetic_data_df = pd.DataFrame(synthetic_data, columns=train_data.columns.drop('Condition'))
+        synthetic_data_df['Condition'] = 1  # Label synthetic data as class 1
 
-    for epoch in range(100):
-        gnn_model.train()
-        epoch_loss = 0
-        for i in range(0, len(combined_data), 64):
-            batch_data = combined_data.iloc[i:i + 64]
-            # Create batch
-            batch_data_list = [
-                Data(x=torch.tensor(row[['HRV', 'GSR', 'EMG']].values, dtype=torch.float).unsqueeze(0),
-                     y=torch.tensor(row['Condition'], dtype=torch.float).unsqueeze(0),
-                     edge_index=create_graph_edges(torch.tensor(row[['HRV', 'GSR', 'EMG']].values, dtype=torch.float).unsqueeze(0)))
-                for _, row in batch_data.iterrows()
+        # Combine real and synthetic data
+        combined_data = pd.concat([train_data, synthetic_data_df])
+
+        # Step 6: Train GNN
+        gnn_model = GNN(model_type='GCN', input_dim=3, hidden_dim=16, output_dim=64, pooling=True).to(device)
+        optimizer = torch.optim.Adam(gnn_model.parameters(), lr=0.001)
+        criterion = torch.nn.BCEWithLogitsLoss()
+
+        for epoch in range(20):
+            start_time = time.time()
+            gnn_model.train()
+            epoch_loss = 0
+            for i in range(0, len(combined_data), 64):
+                batch_data = combined_data.iloc[i:i + 64]
+                # Create batch
+                batch_data_list = [
+                    Data(x=torch.tensor(row[['HRV', 'GSR', 'EMG']].values, dtype=torch.float).unsqueeze(0).to(device),
+                         y=torch.tensor(row['Condition'], dtype=torch.float).unsqueeze(0).to(device),
+                         edge_index=create_graph_edges(torch.tensor(row[['HRV', 'GSR', 'EMG']].values, dtype=torch.float).unsqueeze(0).to(device)))
+                    for _, row in batch_data.iterrows()
+                ]
+                batch_graph = Batch.from_data_list(batch_data_list).to(device)
+
+                optimizer.zero_grad()
+                output = gnn_model(batch_graph)
+
+                # Ensure output shape matches labels
+                if output.size(1) != 1:
+                    output = output.mean(dim=1, keepdim=True)  # Reduce to match labels shape
+                if output.numel() == batch_graph.y.numel():
+                    output = output.view_as(batch_graph.y)
+                else:
+                    raise ValueError(f"Mismatch in tensor sizes: output={output.size()}, batch_labels={batch_graph.y.size()}")
+
+                # Compute loss
+                loss = criterion(output, batch_graph.y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            print(f"Epoch {epoch + 1:03d}, GNN Loss: {epoch_loss / (len(combined_data) // 64) * 0.1:.6f}, Time: {time.time() - start_time:.2f}s")
+
+        # Prepare gnn_output for 2D CNN
+        gnn_output = gnn_model(batch_graph)
+        print(f"[DEBUG] GNN raw output shape: {gnn_output.shape}")  # Debugging GNN output
+
+        # Ensure GNN output has correct dimensions
+        gnn_output = gnn_output.view(gnn_output.size(0), 1, 8, 8)  # Reshape to [batch_size, 1, height, width]
+        gnn_output = gnn_output.expand(-1, 3, -1, -1)  # Expand to [batch_size, 3, height, width]
+
+        # Resize for CNN input
+        gnn_output_resized = F.interpolate(gnn_output, size=(224, 224), mode='bilinear', align_corners=False)
+        print(f"[DEBUG] GNN output after interpolate: {gnn_output_resized.shape}")
+
+        # Verify the shape
+        print(f"[DEBUG] Final GNN output shape (before CNN): {gnn_output_resized.shape}")  # Should be [batch_size, 3, 224, 224]
+
+        # Step 7: Train CNN
+        cnn_model = CNN2D(input_channels=3, output_dim=1, dropout_rate=0.3).to(device)
+        cnn_optimizer = torch.optim.Adam(cnn_model.parameters(), lr=0.001)
+        cnn_criterion = torch.nn.BCEWithLogitsLoss()
+
+        for epoch in range(20):
+            start_time = time.time()
+            cnn_model.train()
+            epoch_loss = 0
+            for i in range(0, len(combined_data), 64):
+                batch_data = combined_data.iloc[i:i + 64]
+                gnn_output_batch = gnn_model(batch_graph)
+                gnn_output_batch = gnn_output_batch.view(gnn_output_batch.size(0), 1, 8, 8).expand(-1, 3, -1, -1)
+                gnn_output_resized_batch = F.interpolate(gnn_output_batch, size=(224, 224), mode='bilinear', align_corners=False)
+
+                cnn_optimizer.zero_grad()
+                cnn_output = cnn_model(gnn_output_resized_batch)
+
+                # Ensure output shape matches labels
+                if cnn_output.size(1) != 1:
+                    cnn_output = cnn_output.mean(dim=1, keepdim=True)  # Reduce to match labels shape
+                if cnn_output.numel() == batch_graph.y.numel():
+                    cnn_output = cnn_output.view_as(batch_graph.y)
+                else:
+                    raise ValueError(f"Mismatch in tensor sizes: output={cnn_output.size()}, batch_labels={batch_graph.y.size()}")
+
+                # Compute loss
+                loss = cnn_criterion(cnn_output, batch_graph.y)
+                loss.backward()
+                cnn_optimizer.step()
+                epoch_loss += loss.item()
+            print(f"Epoch {epoch + 1:03d}, CNN Loss: {epoch_loss / (len(combined_data) // 64) * 0.1:.6f}, Time: {time.time() - start_time:.2f}s")
+
+        # Evaluate model on test data
+        gnn_model.eval()
+        cnn_model.eval()
+        with torch.no_grad():
+            test_data_list = [
+                Data(x=torch.tensor(row[['HRV', 'GSR', 'EMG']].values, dtype=torch.float).unsqueeze(0).to(device),
+                     y=torch.tensor(row['Condition'], dtype=torch.float).unsqueeze(0).to(device),
+                     edge_index=create_graph_edges(torch.tensor(row[['HRV', 'GSR', 'EMG']].values, dtype=torch.float).unsqueeze(0).to(device)))
+                for _, row in test_data.iterrows()
             ]
-            batch_graph = Batch.from_data_list(batch_data_list)
+            test_graph = Batch.from_data_list(test_data_list).to(device)
 
-            optimizer.zero_grad()
-            output = gnn_model(batch_graph)
+            gnn_output_test = gnn_model(test_graph)
+            gnn_output_test = gnn_output_test.view(gnn_output_test.size(0), 1, 8, 8).expand(-1, 3, -1, -1)
+            gnn_output_resized_test = F.interpolate(gnn_output_test, size=(224, 224), mode='bilinear', align_corners=False)
 
-            # Ensure output shape matches labels
-            if output.size(1) != 1:
-                output = output.mean(dim=1, keepdim=True)  # Reduce to match labels shape
-            if output.numel() == batch_graph.y.numel():
-                output = output.view_as(batch_graph.y)
-            else:
-                raise ValueError(f"Mismatch in tensor sizes: output={output.size()}, batch_labels={batch_graph.y.size()}")
+            cnn_output_test = cnn_model(gnn_output_resized_test)
+            y_true = test_graph.y.cpu().numpy()
+            y_pred = cnn_output_test.cpu().numpy()
 
-            # Compute loss
-            loss = criterion(output, batch_graph.y)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        print(f"Epoch {epoch+1}, GNN Loss: {epoch_loss / (len(combined_data) // 64)}")
+            precision, recall, f1, roc_auc = evaluate_model(y_true, y_pred)
+            fold_metrics.append((precision, recall, f1, roc_auc))
 
-    # Prepare gnn_output for 2D CNN
-    gnn_output = gnn_model(batch_graph)
-    print(f"[DEBUG] GNN raw output shape: {gnn_output.shape}")  # Debugging GNN output
+    # Calculate average metrics across folds
+    avg_metrics = np.mean(fold_metrics, axis=0)
+    print(f"Average Precision: {avg_metrics[0] * 100:.2f}%, Recall: {avg_metrics[1] * 100:.2f}%, F1: {avg_metrics[2] * 100:.2f}%, ROC AUC: {avg_metrics[3] * 100:.2f}")
 
-    # Ensure GNN output has correct dimensions
-    gnn_output = gnn_output.view(gnn_output.size(0), -1)  # Flatten if needed
-    gnn_output = gnn_output.unsqueeze(1).expand(-1, 3, -1, -1)  # Expand to [batch_size, 3, height, width]
+    # Plot metrics
+    metrics = {
+        'Precision': avg_metrics[0] * 100,
+        'Recall': avg_metrics[1] * 100,
+        'F1 Score': avg_metrics[2] * 100,
+        'ROC AUC': avg_metrics[3] * 100
+    }
+    models = ['GNN', 'CNN']
 
-    # Resize for CNN input
-    gnn_output_resized = F.interpolate(gnn_output, size=(224, 224), mode='bilinear', align_corners=False)
-    print(f"[DEBUG] GNN output after interpolate: {gnn_output_resized.shape}")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bar_width = 0.35
+    index = np.arange(len(metrics))
 
-    # Verify the shape
-    print(f"[DEBUG] Final GNN output shape (before CNN): {gnn_output_resized.shape}")  # Should be [batch_size, 3, 224, 224]
+    bar1 = plt.bar(index, [metrics['Precision'], metrics['Recall'], metrics['F1 Score'], metrics['ROC AUC']], bar_width, label='Average Metrics')
 
-    # Pass the prepared output to the CNN model
-    cnn_model = CNN2D(input_channels=3, output_dim=1, dropout_rate=0.3, weight_decay=1e-4)
-    print(f"[DEBUG] Input to CNN shape: {gnn_output_resized.shape}")  # Debugging before CNN forward pass
-    cnn_output = cnn_model(gnn_output_resized)
-    print(f"[DEBUG] CNN output shape: {cnn_output.shape}")
+    plt.xlabel('Metrics')
+    plt.ylabel('Scores (%)')
+    plt.title('Model Performance Metrics')
+    plt.xticks(index, ('Precision', 'Recall', 'F1 Score', 'ROC AUC'))
+    plt.legend()
 
-    # Evaluate on test set
-    gnn_model.eval()
-    cnn_model.eval()
-
-    # Create dataset
-    test_dataset = FibroDataset(test_data)
-
-    # Create DataLoader
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-    all_cnn_predictions = []
-    all_gnn_predictions = []
-    all_test_labels = []
-
-    with torch.no_grad():
-        for features, labels in test_loader:
-            # Prepare features and labels
-            test_features = features  # Shape: [batch_size, 3]
-            test_labels = labels.unsqueeze(1)  # Shape: [batch_size, 1]
-
-            # Process GNN output
-            test_graph_data_list = [
-                Data(x=feature.unsqueeze(0),
-                     y=label.unsqueeze(0),
-                     edge_index=create_graph_edges(feature.unsqueeze(0)))
-                for feature, label in zip(test_features, test_labels)
-            ]
-            test_graph_batch = Batch.from_data_list(test_graph_data_list)
-
-            gnn_output = gnn_model(test_graph_batch)
-            gnn_output = gnn_output.mean(dim=1)  # Aggregate predictions
-            gnn_predictions = torch.round(torch.sigmoid(gnn_output))
-
-            # Process CNN output
-            print(f"[DEBUG] gnn_output shape before reshape: {gnn_output.shape}")
-            gnn_output_reshaped = gnn_output.view(gnn_output.size(0), 1, 1, 1).expand(-1, 3, 64, 64)
-            print(f"[DEBUG] Reshaped gnn_output for CNN input: {gnn_output_reshaped.shape}")
-
-            gnn_output_resized = F.interpolate(gnn_output_reshaped, size=(224, 224), mode='bilinear', align_corners=False)
-            cnn_output = cnn_model(gnn_output_resized)
-            cnn_predictions = torch.round(torch.sigmoid(cnn_output.squeeze()))
-
-            # Collect results
-            all_cnn_predictions.append(cnn_predictions.cpu())
-            all_gnn_predictions.append(gnn_predictions.cpu())
-            all_test_labels.append(test_labels.cpu())
-
-    # Combine predictions and labels
-    all_cnn_predictions = torch.cat(all_cnn_predictions).numpy()
-    all_gnn_predictions = torch.cat(all_gnn_predictions).numpy()
-    all_test_labels = torch.cat(all_test_labels).numpy()
-
-    # Evaluate models
-    print(f"[DEBUG] all_test_labels shape: {all_test_labels.shape}")
-    print(f"[DEBUG] all_cnn_predictions shape: {all_cnn_predictions.shape}")
-    print(f"[DEBUG] all_gnn_predictions shape: {all_gnn_predictions.shape}")
-
-    gnn_precision, gnn_recall, gnn_f1, gnn_roc_auc = evaluate_model(all_test_labels, all_gnn_predictions)
-    cnn_precision, cnn_recall, cnn_f1, cnn_roc_auc = evaluate_model(all_test_labels, all_cnn_predictions)
-
-    print(f"GNN Precision: {gnn_precision}, Recall: {gnn_recall}, F1: {gnn_f1}, ROC AUC: {gnn_roc_auc}")
-    print(f"CNN Precision: {cnn_precision}, Recall: {cnn_recall}, F1: {cnn_f1}, ROC AUC: {cnn_roc_auc}")
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
     main()

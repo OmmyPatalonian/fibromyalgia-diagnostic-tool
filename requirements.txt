@@ -1,6 +1,9 @@
 numpy
 pandas
-tensorflow
-scikit-learn
 torch
+scikit-learn
+matplotlib
+seaborn
 torch-geometric
+tensorflow
+torchvision

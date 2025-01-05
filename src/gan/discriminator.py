@@ -1,14 +1,20 @@
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LeakyReLU, Dropout
+import torch
+import torch.nn as nn
 
-def build_discriminator(data_dim, num_classes):
-    data_input = tf.keras.Input(shape=(data_dim,))
-    label_input = tf.keras.Input(shape=(1,))
-    label_embedding = tf.keras.layers.Embedding(num_classes, data_dim)(label_input)
-    label_flat = tf.keras.layers.Flatten()(label_embedding)
+class Discriminator(nn.Module):
+    def __init__(self, data_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(data_dim, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
 
-    merged_input = tf.keras.layers.Concatenate()([data_input, label_flat])
-    x = tf.keras.layers.Dense(128, activation="relu")(merged_input)
-    x = tf.keras.layers.Dense(1, activation="sigmoid")(x)
-    return tf.keras.Model([data_input, label_input], x)
+    def forward(self, x):
+        return self.model(x)
+
+def build_discriminator(data_dim):
+    return Discriminator(data_dim)

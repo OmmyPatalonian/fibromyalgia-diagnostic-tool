@@ -1,24 +1,26 @@
 import numpy as np
+import pandas as pd
 
-def generate_realistic_data(num_samples, is_fibro=False):
+def generate_realistic_data(num_samples=1000):
     """
     Generate realistic HRV, GSR, and EMG data for normal or Fibromyalgia patients.
     :param num_samples: Number of samples.
-    :param is_fibro: Whether the data represents Fibromyalgia symptoms.
-    :return: Combined dataset (HRV, GSR, EMG).
+    :return: Combined dataset (HRV, GSR, EMG, Condition).
     """
-    print(f"Generating realistic data for {'Fibromyalgia' if is_fibro else 'Normal'} patients...")
-    if is_fibro:
-        # Fibromyalgia ranges
-        hrv_data = np.random.uniform(50, 60, size=num_samples)
-        gsr_data = np.random.uniform(5.3, 7, size=num_samples)
-        emg_data = np.random.uniform(8, 10, size=num_samples)
-    else:
-        # Normal ranges
-        hrv_data = np.random.uniform(60, 100, size=num_samples)
-        gsr_data = np.random.uniform(1, 5, size=num_samples)
-        emg_data = np.random.uniform(1, 7, size=num_samples)
+    print("Generating realistic data...")
 
-    combined_data = np.stack([hrv_data, gsr_data, emg_data], axis=1)
+    # Generate synthetic data for "fibro" and "normal" conditions
+    fibro_data = np.random.normal(loc=[55, 6, 9], scale=[5, 0.5, 1], size=(num_samples // 2, 3))
+    normal_data = np.random.normal(loc=[80, 3, 4], scale=[10, 1, 2], size=(num_samples // 2, 3))
+
+    # Create DataFrame and assign labels
+    fibro_df = pd.DataFrame(fibro_data, columns=['HRV', 'GSR', 'EMG'])
+    fibro_df['Condition'] = 1  # 1 for Fibro
+
+    normal_df = pd.DataFrame(normal_data, columns=['HRV', 'GSR', 'EMG'])
+    normal_df['Condition'] = 0  # 0 for Normal
+
+    # Combine the data
+    data = pd.concat([fibro_df, normal_df], ignore_index=True)
     print("Data generation completed.")
-    return combined_data
+    return data
